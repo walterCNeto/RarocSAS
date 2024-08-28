@@ -1,0 +1,860 @@
+/*CALCULADORA DE RAROC*/
+/*AUTOR: "o Gaggiato" WCN*/
+/*DATA: ago/24*/
+/*VERSAO: 1.001*/
+
+options spool obs = max;
+
+libname output "/home/u50904107";
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 01]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+/*DE PARA DA QUANTIDADE DE DIAS PARA A QUANTIDADE DE MESES PARA CARENCIA DE PRAZO*/
+proc format;
+value shift
+low -< 15  = 0
+15  -< 45  = 1
+45  -< 75  = 2
+75  -< 105 = 3
+105 -< 135 = 4
+135 -< 165 = 5
+165 -< 195 = 6
+195 -< 225 = 7
+225 -< 255 = 8
+255 -< 285 = 9
+285 -< 315 = 10
+315 -< 345 = 11
+345 -< 365 = 12
+;
+run;
+
+/*CUSTO DO CAPITAL EXIGIDO = FTP[106% DI aa] + SPREAD[4% aa] = 17.65%aa + 4%aa[SPREAD] JUROS SIMPLES AO ANO*/
+/* ago/24 mercado Brasileiro*/
+
+data output.base_entrada;
+input 
+	num_cpf_cnpj
+	proposta
+	taxa_funding
+	taxa_cdi
+	produto $3.
+	sistema $6.
+	pessoa $2.
+	segmento $6.
+	;
+cards;
+2222 1234 0.01153 0.01153 EP PRICE F VAREJO
+;run;
+
+%macro InsereParametros(borig, bdest);
+data &bdest.;
+	set &borig.;
+		taxa_produto =  &taxa_am.;
+		prazo = &prazo.;
+		vlr_contratado = &VP.;
+		carencia = &carencia.;
+		PD_12 = &PD_12.;
+		num_mes_ref = &num_mes_ref.;
+	run;
+%mend;
+
+/*TAXAS DE JUROS DIARIAS*/
+%macro taxas_dia(borig, bdest);
+	data &bdest.;
+	set &borig.;
+		taxa_produto_dia = ((1+taxa_produto)**(1/30))-1;
+		taxa_funding_dia = ((1+taxa_funding)**(1/30))-1;
+		taxa_cdi_dia = ((1+taxa_cdi)**(1/30))-1;
+	run;
+%mend;
+
+/*AJUSTA A REFERENCIA EM CASO DE CARENCIA DE PRAZOS DE PAGAMENTO*/
+%macro carencia(borig, bdest);
+	data &bdest.;
+		set &borig.;
+			car_aux = sum(carencia, -30);
+			mob_car = (put(car_aux, shift.))*1;
+	run;
+%mend;
+
+/*CRIA AS REFERENCIAS DE CALCULO COM BASE NA CARENCIA DE PRAZO DE PAGAMENTOS*/
+%macro carencia2(borig, bdest);
+	data &bdest.;
+		set &borig.;
+			do i = -mob_car to prazo by 1;
+				mob_aux = i;
+			output;
+			end;
+	run;
+	data &bdest.;
+		set &bdest.;
+			if -mob_car <= i <= 0 then do;
+				flag_car = 1;
+			end;
+			else do;
+				flag_car = 0;
+			end;
+			mob = sum(mob_aux, mob_car);
+			mobref = input(put(intnx('month', input(put(num_mes_ref,6.),yymmn6.),mob),yymmn6.),6.);
+			dias_corridos = day(intnx('month', input(put(mobref,6.),yymmn6.),1)-1);
+	run;
+	data &bdest.;
+		set &bdest.;
+		if mob = 0 then exp_dias = 0;
+		if mob = 1 then exp_dias = 30;
+		if mob > 1 then exp_dias = 29;
+	run;
+	data &bdest.;
+	set &bdest.;
+		vlr_contratado_corr = vlr_contratado*(1+taxa_produto)**mob_car;
+		vlr_contratado_corr_funding = vlr_contratado*(1+taxa_funding)**mob_car;
+	run;
+%mend;
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 02]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+/*CASO EXISTAM MAIS DE UM CONTRATO PARA ANALISAR, SEPARA ENTRE SAC E PRICE*/
+%macro fluxo_financeiro(borig, bdest1, bdest2);
+	data &bdest1. &bdest2.;
+		set &borig.;
+		if sistema EQ 'SAC' then do;
+			output &bdest1.;
+		end;
+		if sistema EQ 'PRICE' then do;
+			output &bdest2.;
+		end;
+	run;	
+%mend;
+
+/*EVOLUIR O FLUXO NO SISTEMA SAC - SISTEMA DE AMORTIZACAO CONSTANTE*/
+%macro sac(borig, bdest);
+	data &bdest.;
+		set &borig.;	
+		if (mob >= 0) and (mob <= mob_car) then do;
+			sd = vlr_contratado*(1+taxa_produto)**mob;
+			sd_funding = vlr_contratado*(1+taxa_funding)**mob;
+			juros = lag(sd)*taxa_produto;
+			juros_funding = lag(sd_funding)*taxa_funding;
+		end;
+		if (mob > mob_car) then do;
+			amortizacao = vlr_contratado_corr/prazo;
+			amort_funding = vlr_contratado_corr_funding/prazo;
+			juros = (vlr_contratado_corr - (mob_aux - 1)*amortizacao)*taxa_produto;
+			juros_funding = (vlr_contratado_corr_funding - (mob_aux - 1)*amort_funding)*taxa_funding;
+			pagamento = sum(juros, amortizacao);
+			pgto_funding = sum(juros_funding, amort_funding);
+			sd = sum(vlr_contratado_corr, -mob_aux*amortizacao);
+			sd_funding = sum(vlr_contratado_corr_funding, -mob_aux*amort_funding);
+		end;
+		if mob = 0 then do;
+			juros = 0;
+			juros_funding = 0;
+			pagamento = 0;
+			pgto_funding = 0;
+			sd = vlr_contratado;
+			sd_funding = vlr_contratado;
+		end;
+		if 0 <= mob <= mob_car then do;
+			amortizacao = 0;
+			amort_funding = 0;
+			pagamento = 0;
+			pgto_funding = 0;
+		end;
+		if mob_aux LT 0 then do;
+			juros = 0;
+		end;
+	run;
+%mend;
+
+/*EVOLUIR O FLUXO NO SISTEMA PRICE - SISTEMA DE PAGAMENTO CONSTANTE*/
+%macro price(borig, bdest);
+	data &bdest.;
+		set &borig.;
+		amortizacao = ppmt(taxa_produto, mob_aux, prazo, vlr_contratado_corr, 0, 0);
+		amort_funding = ppmt(taxa_funding, mob_aux, prazo, vlr_contratado_corr_funding, 0, 0);	
+		if (mob >= 0) and (mob <= mob_car) then do;
+			sd = vlr_contratado*(1+taxa_produto)**mob;
+			sd_funding = vlr_contratado*(1+taxa_funding)**mob;
+			juros = lag(sd)*taxa_produto;
+			juros_funding = lag(sd_funding)*taxa_funding;
+		end;
+		if (mob > mob_car) then do;			
+			juros = ipmt(taxa_produto, mob_aux, prazo, vlr_contratado_corr, 0, 0);
+			juros_funding = ipmt(taxa_funding, mob_aux, prazo, vlr_contratado_corr_funding, 0, 0);			
+			pagamento = pmt(taxa_produto, prazo, vlr_contratado_corr, 0, 0);
+			pgto_funding = pmt(taxa_funding, prazo, vlr_contratado_corr_funding, 0, 0);
+			sd = sum(vlr_contratado_corr, -amortizacao_acum);
+			sd_funding = sum(vlr_contratado_corr_funding, -amortizacao_acum_funding);
+		end;
+		if mob = 0 then do;
+			juros = 0;
+			juros_funding = 0;
+			pagamento = 0;
+			pgto_funding = 0;
+			sd = vlr_contratado;
+			sd_funding = vlr_contratado;
+		end;
+		if 0 <= mob <= mob_car then do;
+			amortizacao = 0;
+			amort_funding = 0;
+			pagamento = 0;
+			pgto_funding = 0;
+		end;
+		amortizacao_acum + amortizacao;
+		amortizacao_acum_funding + amort_funding;
+	run;	
+	proc sort data = &bdest.;
+		by descending mob;
+	run;	
+	data &bdest.;
+		set &bdest.;
+			lead_value_sd = lag(sd);
+			lead_value_sd_funding = lag(sd_funding);
+	run;
+	proc sort data = &bdest.;
+		by mob;
+	run;	
+	data &bdest.;
+		set &bdest.;
+		if mob_aux GT 0 then do;
+			sd = lead_value_sd;
+			sd_funding = lead_value_sd_funding;
+		end;
+	run;
+	data &bdest. (drop = lead_value_sd lead_value_sd_funding);
+		set &bdest.;
+		if sd EQ . then do;
+			sd = 0;
+		end;
+		if sd_funding EQ . then do;
+			sd_funding = 0;
+		end;
+		if mob_aux LT 0 then do;
+			juros = 0;
+		end;
+	run;
+%mend;
+
+/*JUNTA AS BASES SAC E PRICE*/
+%macro junta_fluxos(borig1, borig2, bdest);
+	data &bdest.;
+		set &borig1. &borig2.;
+	run;	
+%mend;
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 03]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+/*CALCULA O IOF PARA RECALCULAR O FLUXO CONSIDERANDO O IMPOSTO FINANCIADO*/
+%macro CalculaIOF(borig, bdest);
+	data &bdest. (drop = amortizacao_acum amortizacao_acum_funding);
+		set &borig.;
+			iofdays = min(mob*(365.25/12),365.25);
+			if pessoa EQ 'F' then 
+				iofnf = amortizacao*(0.0038+(0.000082*iofdays));
+			if pessoa EQ 'J' and vlr_contratado LE 30000 then
+				iofnf = amortizacao*(0.0000137+(0.000041*iofdays));				
+			if pessoa EQ 'J' and vlr_contratado GT 30000 then
+				iofnf = amortizacao*(0.0038+(0.000041*iofdays));
+			if 0 <= mob <= mob_car then do;
+		    	iofdays = 0;
+		    	iofnf = 0;
+		    end;		    
+	run;				
+%mend;
+
+/*CALCULA O IOF ACUMULADO*/
+%macro IOFAcum(borig, bdest);
+	proc sql;
+		create table &bdest. as select 
+			num_cpf_cnpj,
+			proposta,
+			num_mes_ref,
+			sum(iofnf) as IOFAcum
+		from &borig.
+		group by 1,2,3;
+	quit;
+%mend;
+
+/*ADICIONA O IOF NO MONTANTE DO EMPRESTIMO COM VALOR CORRIGIDO POR CARENCIA DE PRAZO (SE HOUVER)*/
+%macro SomaIOF(borig1, borig2, bdest);
+	proc sql;
+		create table &bdest. as select
+		a.*,
+		b.IOFAcum
+		from &borig1. as a left join &borig2. as b
+		on 	a.num_cpf_cnpj EQ b.num_cpf_cnpj and
+			a.proposta EQ b.proposta and
+			a.num_mes_ref EQ b.num_mes_ref;
+	quit;
+%mend;
+%macro AdicionaIOF(borig, bdest);
+	data &bdest.;
+		set &borig.;
+			vlr_contratado = sum(vlr_contratado, IOFAcum);
+	run;
+%mend;
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 04]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+/*ADICIONA AS TARIFAS (TAC) E CUSTOS DE ADMINISTRACAO*/
+%macro AplicaCustosTarifa(borig, bdest);
+	data &bdest. (drop = TAC);
+		set &borig.;
+			if mob EQ 0 then Custo_em_dia = 300;
+			if mob GT 0 then Custo_em_dia = 10;
+			TAC = 0.01*vlr_contratado_corr;
+			if mob EQ 0 then Tarifa = MIN(450, TAC);
+			if mob GT 0 then Tarifa = 0;
+	run;
+%mend;
+
+/*CRIA AS CURVAS DE PD (PROBABILIDADE DE DEFAULT) E PAND (PROBABILIDADE DE PAGAMENTO ANTECIPADO) ACUMULADAS*/
+/*ABORDAGEM DE POISSON - SERA UMA PROXY PARA A PROBABILIDADE ACUMULADA DE DEFAULT PARA O RISCO DE
+CREDITO [PG 552 [6]]*/
+%macro CriaPDePAND(borig, bdest);
+	data &bdest.;
+	set &borig.;
+		
+		/*A PD É EM 12 MESES, LOGO A HAZARD RATE É DE 12 MESES E DEVE SER APLICADA NO PERIODO PROPORCIONAL DE
+		01 ANO*/
+		PERC_YEAR = (MOB/12);
+		GX1 = CONSTANT('E')**(LOG(1-PD_12)*PERC_YEAR);
+		PDACUM = SUM(1,-GX1);
+		
+		/*USANDO A MESMA PREMISSA PARA A TAXA DE QUITACAO ANTECIPADA*/
+		TAXA_PGTO_ANTECIPADO = (0.05/100);
+		GX2 = CONSTANT('E')**(LOG(1-TAXA_PGTO_ANTECIPADO)*PERC_YEAR);
+		PANDACUM = SUM(1,-GX2);
+run;	
+%mend;
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 05]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+/*CALCULO DO RAROC PIT*/
+%macro CalculaRAROC(borig, bdest1, bdest2, bdest3, bdest4, bdest5, bdest6);
+	proc sort data = &borig. out = &bdest1.;
+		by num_cpf_cnpj proposta num_mes_ref mob sistema;
+	run;
+	data &bdest1.;
+		set &bdest1.;
+		
+			/*CURVA QUE DESCREVE O PERCENTUAL DA OPERACAO NAO QUITADO E NAO DEFAULT*/
+			SOBREVIVENCIA_PD_PAND = MAX(SUM(1,-PDACUM,-PANDACUM),0);			
+			
+			/*CURVA QUE DESCREVE O PERCENTUAL DA OPERACAO NAO QUITADO*/
+			SOBREVIVENCIA_PAND = MAX(SUM(1,-PANDACUM),0);			
+			
+			/*PD DO CLIENTE*/
+			IF MOB EQ 1 THEN DO;
+				PD_CLIENTE = PD_12;
+			END;
+			ELSE DO;
+				PD_CLIENTE = -1;
+			END;
+			
+			/*A MARGEM FINANCEIRA EM DIA E A DIFERENCA ENTRE O JUROS GERADO PELO FINANCIAMENTO E O JUROS
+			PAGO A TESOURARIA*/
+			MFB_em_dia = sum(juros, -juros_funding);
+	run;
+	data &bdest1.;
+		set &bdest1.;
+		/*PATAMAR INICIAL DE LGDS CONSIDERADOS A PARTIR DAS GARANTIAS CONHECIDAS - COLLATERAL*/
+			if produto EQ "CONSIGNADO" then do;
+				if mob EQ 0 then LGD_K = 0.75;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			if produto EQ "IMOVEL" then do;
+				if mob EQ 0 then LGD_K = 0.25;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			if produto EQ "VEICULO"	then do;
+				if mob EQ 0 then LGD_K = 0.50;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			if produto EQ "EP" then do;
+				if mob EQ 0 then LGD_K = 0.75;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			if produto EQ "CAPITAL DE GIRO" then do;
+				if mob EQ 0 then LGD_K = 0.75;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			if produto EQ "DESCONTO DE CHEQUE" then do;
+				if mob EQ 0 then LGD_K = 0.75;
+				if mob GT 0 then LGD_K = 1;
+			end;
+			
+			/*ABORDAGEM PADRONIZADA (SA) PARA O VAREJO APRESENTA COEFICIENTE DE 12% NA 
+			MARGEM FINANCEIRA BRUTA*/
+			if mob EQ 0 then ALPHA_RO = 0;
+			if mob GT 0 then ALPHA_RO = 0.12;
+			
+			/*CUSTO DE CAPITAL CONSIDERADO DE 10%aa*/
+			CUSTO_CAPITAL_AA = &custo_capital_aa.;
+			
+			/*ALIQUOTAS DE IMPOSTOS*/
+			A_ISS = 0.05;
+			PIS_COFINS = 0.0465;
+			IR_CS = 0.4;
+			
+			/*INFLACAO DE 0,5%am*/
+			INFLACAO = 0.005;
+			
+			/*PARAMETROS PARA O CALCULO DO AJUSTE AO PRAZO*/
+			IF MOB EQ 0 THEN MOB_ANO = 0;
+			IF MOB GT 0 THEN MOB_ANO = 1/12;
+	run;
+	data &bdest1.;
+		set &bdest1.;
+			MOB_ANO_ACUM + MOB_ANO;
+	run;
+	
+	/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 06]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+		
+	data &bdest1. (DROP = amortizacao_acum amortizacao_acum_funding);
+		set &bdest1.;
+			
+			/*MARGEM FINANCEIRA EM DIA - TUDO O QUE NAO FOI A DEFAULT OU NAO PAGOU ANTECIPADO GEROU MARGEM*/
+			MFB_em_dia_atuarial = SOBREVIVENCIA_PD_PAND*MFB_em_dia;
+			
+			/*O EXPOSURE AT DEFAULT CONSIDERA O QUE NAO FOI LIQUIDADO ANTECIPADAMENTE MAS MANTEM O SALDO QUE 
+			FOI A DEFAULT*/
+			EAD_atuarial = SOBREVIVENCIA_PAND*SD;
+			RM = SUM((SUM(PRAZO, MOB_CAR)/12), -MOB_ANO_ACUM);
+			
+			/*REGUA SUGERIDA - USAR A INTERNA DA IF*/
+			IF PD_12 >= 0 AND PD_12 <= (0.02/100) THEN DO;			
+				RATING_CLIENTE = "AAA";
+			END;
+			IF PD_12 > (0.02/100) AND PD_12 <= (0.03/100) THEN DO;			
+				RATING_CLIENTE = "AA";
+			END;
+			IF PD_12 > (0.03/100) AND PD_12 <= (0.07/100) THEN DO;			
+				RATING_CLIENTE = "A";
+			END;
+			IF PD_12 > (0.07/100) AND PD_12 <= (0.18/100) THEN DO;			
+				RATING_CLIENTE = "BBB";
+			END;
+			IF PD_12 > (0.18/100) AND PD_12 <= (0.70/100) THEN DO;			
+				RATING_CLIENTE = "BB";
+			END;
+			IF PD_12 > (0.70/100) AND PD_12 <= (2/100) THEN DO;			
+				RATING_CLIENTE = "B";
+			END;
+			IF PD_12 > (2/100) AND PD_12 <= (6/100) THEN DO;		
+				RATING_CLIENTE = "CCC";
+			END;
+			IF PD_12 > (6/100) AND PD_12 <= (12/100) THEN DO;			
+				RATING_CLIENTE = "CC";
+			END;
+			IF PD_12 > (12/100) AND PD_12 <= (20/100) THEN DO;			
+				RATING_CLIENTE = "C";
+			END;
+			IF PD_12 > (20/100) THEN DO;			
+				RATING_CLIENTE = "D";
+			END;
+			
+			PD_1 = PDACUM;
+			
+			/*PISO DA PD*/
+			PD_0 = 0.0003;
+						
+			/*PISO DO LGD*/
+			LGD_0 = 0.0003;
+			
+			PD_X = MAX(PD_1, PD_0);
+			LGD_X = MAX(LGD_K, LGD_0);
+			PD = PD_X;
+			
+			/*LAM, DR. YAT-FAI - AJUSTE AO PRAZO E CALCULO DA CHANCE*/
+			
+			/*AJUSTE AO PRAZO*/
+			CHANCE = SUM(1,-(1-PD)**RM);
+			
+			/*LGD_1 = MIN(SUM(LGD_X, PERC_YEAR*PDACUM),0.9);*/
+			LGD_1 = LGD_X;
+			LGD = LGD_1;
+			
+			/*CALCULO DA PERDA ESPERADA COM AJUSTE AO PRAZO*/
+			PE = CHANCE*EAD_atuarial*LGD;
+			
+			/*MODELO CIRC. BACEN 3.648 ASRF DERIVADO DE / VASCICEK / MERTON - RISCO SISTEMATICO*/
+			EL = CHANCE*LGD;
+			F1= QUANTILE('NORMAL', PD, 0, 1);
+			F2= QUANTILE('NORMAL', SUM(1, -0.999), 0, 1);
+			KF1 = (11.852/100);
+			KF2 = (5.478/100);
+			I = 1;
+			KB = (KF1 - KF2*LOG(PD))**2;
+			KBF = DIVIDE((1+((SUM(PRAZO, MOB_CAR)/12)-2.5)*KB),(1-1.5*KB));
+			
+			/*COPULA CORRELATION COEFFICIENT CIRC. BACEN 3.648*/
+			FACTOR = (DIVIDE((1-CONSTANT('E')**(-35*PD)),(1-CONSTANT('E')**(-35))));
+			H_FACTOR = SUM(1, -FACTOR);
+			FACTOR2 = (DIVIDE((1-CONSTANT('E')**(-50*PD)),(1-CONSTANT('E')**(-50))));
+			H_FACTOR2 = SUM(1, -FACTOR2);
+			IF PRODUTO EQ 'IMOVEL' AND SEGMENTO EQ 'VAREJO' THEN KR = 0.15;
+			IF PRODUTO EQ 'IMOVEL' AND SEGMENTO NE 'VAREJO' THEN KR = (1+0.25*I)*(0.12*FACTOR2 + 0.24*H_FACTOR2);
+			IF PRODUTO NE 'IMOVEL' AND SEGMENTO EQ 'VAREJO' THEN KR = 0.03*FACTOR + 0.16*H_FACTOR;
+			IF PRODUTO NE 'IMOVEL' AND SEGMENTO NE 'VAREJO' THEN KR = (1+0.25*I)*(0.12*FACTOR2 + 0.24*H_FACTOR2);
+			NST = F1-(KR)**(1/2)*F2;
+			DST = ((1-KR)**(1/2))**(-1);
+			ARG = NST*DST;
+			N_ARG = CDF('NORMAL', ARG);
+			
+			/*RECEITA ANUAL BRUTA INFERIOR A R$3.6MM (RES. 3.648 ART 7 - III) = VAREJO*/
+			IF SEGMENTO EQ 'VAREJO' THEN K = (LGD*N_ARG-PD*LGD);
+			IF SEGMENTO NE 'VAREJO' THEN K = (LGD*N_ARG-PD*LGD)*KBF;
+			
+			/*CALCULO DA PERDA INESPERADA*/
+			UL = K*EAD_atuarial;
+			
+			/*CALCULO DA PERDA ESPERADA SOMADA A INESPERADA*/
+			UL_X = SUM(UL, PE);
+			q_factor = 1;
+			perc_min = 0.04;
+			perc_cr = 0.13;
+			VAR_CREDITO = MAX(UL_X, 0);
+			IF MOB = 0 THEN VAR_CREDITO = 0;
+			CEA_RO = MAX(ALPHA_RO*MFB_em_dia_atuarial, 0);
+			
+			/*CAPITAL CALCULADO COMO PERDA ESPERADA + PERDA INESPERADA + CAPTAL MINIMO + CAPITAL DE RISCO OPERACIONAL*/
+			CEA_1 = SUM(q_factor*VAR_CREDITO, perc_min*EAD_atuarial, CEA_RO);
+			IF MOB = 0 THEN CEA_1 = 0;
+			
+			/*CAPITAL CALCULADO COMO 13% DA EXPOSICAO*/
+			CEA_2 = perc_cr*EAD_atuarial;
+			IF MOB = 0 THEN CEA_2 = 0;
+			
+			/*CAPITAL CONSIDERADO O MAIOR ENTRE CEA_1 E CEA_2*/
+			IF MOB GE 1 THEN DO; 
+				CEA_X = MAX(CEA_1,CEA_2);
+			END;
+			IF MOB LE 0 THEN DO;
+				CEA_X = 0;
+			END;
+			
+			/*FATOR DE VALOR PRESENTE*/
+			FATOR_VP = (1/((1 + INFLACAO)**MOB));
+			
+			/*CALCULO DO CAPITAL FINAL*/
+			CEA_FINAL_K = CEA_X*FATOR_VP;
+			
+			/*REMUNERACAO DO CAPITAL*/
+			REM_CEA = SUM(CEA_FINAL_K*(1+TAXA_CDI)**MOB, -CEA_FINAL_K);
+			
+			/*IMPOSTO SOBRE A TARIFA*/
+			IMPOSTO_TARIFA = MAX(A_ISS*Tarifa,0);
+			
+			/*PRODUTO BANCARIO - RECEITAS DE TARIFAS, MARGENS E REMUNERACAO DO CAPITAL*/
+			PB = SUM(REM_CEA, Tarifa, MFB_em_dia_atuarial);
+			
+			/*PIS COFINS INCIDE DIRETAMENTE NO PRODUTO BANCARIO*/
+			IMPOSTO_PIS_COFINS = MAX(PIS_COFINS*PB,0);
+			
+			/*AUMENTO NA PERDA*/
+			AUMENTO_PE = ABS(MIN(SUM(lag(PE), -PE),0));
+			
+			/*DIMINUICAO DA PERDA*/
+			DIMINUICAO_PE = MAX(SUM(lag(PE), -PE),0);
+			
+			/*REVERSAO DA PERDA*/
+			REVERSAO_PE = (1 + TAXA_PRODUTO)*DIMINUICAO_PE;
+			
+			/*CUSTO DE COBRANCA PROPORCIONAL A REVERSAO DE PERDA*/
+			CUSTO_COBRANCA_ATRASO = MAX((1-(PE/LAG(PE))),0)*5;
+			
+			/*RESULTADO OPERACIONAL COMO A SOMA DO PRODUTO BANCARIO E OS CUSTOS DA PERDA ESPERADA*/
+			RO = SUM(PB, REVERSAO_PE, -AUMENTO_PE, -PE);
+			
+			/*LUCRO ANTES DO IMPOSTO DE RENDA (IR) E CONTRIBUICAO SOCIAL (CS),
+			CONSIDERANDO RO OS CUSTOS E DESPESAS TRIBUTARIAS*/
+			LAIR = SUM(RO, -CUSTO_COBRANCA_ATRASO, -CUSTO_EM_DIA, -IMPOSTO_PIS_COFINS, -IMPOSTO_TARIFA);
+			IMPOSTO_IR_CS = MAX(IR_CS*LAIR,0);
+			
+			/*RESULTADO GERENCIAL OPERACIONAL LIQUIDO DE IR E CS*/
+			RGO = SUM(LAIR, -IMPOSTO_IR_CS);
+			
+			/*RESULTADO TRAZIDO A VALOR PRESENTE*/
+			RGO_FINAL = RGO*FATOR_VP;
+			
+			/*CUSTO DO CAPITAL AO MES*/
+			CUSTO_CAPITAL_AM = SUM((1+CUSTO_CAPITAL_AA)**(1/12),-1);
+			FATOR_VPL = (1/((1+CUSTO_CAPITAL_AM)**MOB));
+			IF MOB = 0 THEN VALOR_INVESTIDO = -vlr_contratado_corr;
+			IF MOB NE 0 THEN VALOR_INVESTIDO = 0;
+			VPL = SUM(FATOR_VPL*PAGAMENTO, VALOR_INVESTIDO);
+			TIR = TAXA_PRODUTO;/*JA QUE E UM FLUXO COM PAGAMENTO PREVISTOS NO SISTEMA PRICE*/
+			
+			/*SALDO DA CARTEIRA*/
+			SALDO_CARTEIRA = SUM(SOBREVIVENCIA_PAND*SD, AUMENTO_PE);
+	run;
+	data &bdest2.;
+	set &bdest1.;
+		CEA_FINAL_K_ACUM + CEA_FINAL_K;
+		RGO_FINAL_ACUM + RGO_FINAL;
+		PERDA_ESPERADA_ACUM + PE;
+	run;
+	proc sql;
+		create table T as select 
+			num_cpf_cnpj,
+			proposta,
+			num_mes_ref,
+			max(RGO_FINAL_ACUM) as RGO_MAX
+		from &bdest2.
+		group by 1,2,3;
+	quit;
+	proc sql;
+		create table &bdest3. as select 
+		a.*,
+		b.RGO_MAX
+		from &bdest2. as a left join T as b 
+		on 	a.num_cpf_cnpj EQ b.num_cpf_cnpj and
+			a.proposta EQ b.proposta and
+			a.num_mes_ref EQ b.num_mes_ref;
+	quit;
+	proc sort data = &bdest3. out = &bdest3.;
+		by num_cpf_cnpj proposta num_mes_ref mob sistema;
+	run;
+	data &bdest4.;
+	set &bdest3.;
+		
+		IF MOB GE 1 THEN DO; 
+			CEA_FINAL_K_MEDIO = DIVIDE(CEA_FINAL_K_ACUM, MOB);
+		END;
+		IF MOB EQ 0 THEN DO; 
+			CEA_FINAL_K_MEDIO = 0;
+		END;
+	
+		/*RAROC PIT*/
+		RAROC_EX_ANT_PIT = DIVIDE(RGO_FINAL_ACUM, CEA_FINAL_K_MEDIO);
+		
+		/*NAO HA CRIACAO DE VALOR ANTES DO MOB 1*/
+		IF MOB EQ 0 THEN DO;		
+			A_ISS=0;
+			ALPHA_RO=0;
+			ARG=0;
+			CEA_RO=0;
+			CHANCE=0;
+			CUSTO_CAPITAL_AA=0;
+			CUSTO_CAPITAL_AM=0;
+			DST=0;
+			EL=0;
+			F1=0;
+			F2=0;
+			FACTOR=0;
+			FACTOR2=0;
+			FATOR_VPL=0;
+			GX1=0;
+			GX2=0;
+			H_FACTOR=0;
+			H_FACTOR2=0;
+			INFLACAO=0;
+			IR_CS=0;
+			K=0;
+			KB=0;
+			KBF=0;
+			KF1=0;
+			KF2=0;
+			KR=0;
+			LGD=0;
+			LGD_0=0;
+			LGD_1=0;
+			LGD_K=0;
+			LGD_X=0;
+			MOB_ANO=0;
+			N_ARG=0;
+			NST=0;
+			PANDACUM=0;
+			PD=0;
+			PD_0=0;
+			PD_1=0;
+			PD_CLIENTE=0;
+			PD_X=0;
+			PDACUM=0;
+			PE=0;
+			PERC_CR=0;
+			PERC_MIN=0;
+			PERC_YEAR=0;
+			PIS_COFINS=0;
+			Q_FACTOR=0;
+			RAROC_EX_ANT_PIT=0;
+			RGO_MAX=0;
+			SOBREVIVENCIA_PAND=0;
+			SOBREVIVENCIA_PD_PAND=0;
+			TAXA_PGTO_ANTECIPADO=0;
+			TIR=0;
+			UL=0;
+			UL_X=0;
+			FATOR_VP=0;
+		END;
+	run;
+	proc sql;
+		create table &bdest5. as select
+				num_cpf_cnpj,
+				proposta,
+				produto,
+				pessoa,
+				num_mes_ref,
+				carencia,
+				sistema,
+				RATING_CLIENTE,
+				max(MOB_CAR) as MOB_CAR,
+				max(PD_CLIENTE) as PD_CLIENTE,
+				max(PD) as PD,
+				max(LGD) as LGD,			
+				max(taxa_cdi) as taxa_cdi,
+				max(vlr_contratado) as vlr_contratado,
+				max(IOFAcum) as IOF,
+				max(prazo) as prazo,
+				max(taxa_produto) as taxa_produto_am,
+				max(taxa_funding) as taxa_funding_am,
+				max(taxa_cdi) as taxa_cdi_am,
+				max(CUSTO_CAPITAL_AA) as CUSTO_CAPITAL_AA,
+				max(CUSTO_CAPITAL_AM) as CUSTO_CAPITAL_AM,
+				max(CEA_FINAL_K_ACUM) as CEA_NUM,
+				sum(RGO_FINAL) as RGO,
+				sum(PE) as PE,
+				sum(RO) as RO,
+				sum(AUMENTO_PE) as AUMENTO_PE,
+				sum(DIMINUICAO_PE) as DIMINUICAO_PE,
+				sum(MFB_em_dia_atuarial) as MFB,
+				sum(LAIR) as LAIR,
+				sum(IMPOSTO_IR_CS) as IMPOSTO_IR_CS,
+				sum(CUSTO_COBRANCA_ATRASO) as custo_cobranca_atraso,
+				sum(Custo_em_dia) as custo_em_dia,
+				sum(IMPOSTO_PIS_COFINS) as IMPOSTO_PIS_COFINS,
+				sum(IMPOSTO_TARIFA) as IMPOSTO_TARIFA,
+				sum(PB) as PB,
+				sum(VPL) as VPL
+			from &bdest2.
+		group by 1,2,3,4,5,6,7,8;
+	quit;
+	
+	/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 07]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+	
+	data &bdest6. (DROP = CEA_NUM PE RO PB RGO);
+		set &bdest5.;
+			/* P&L GERADO*/
+			PRODUTO_BANCARIO = PB;
+			PERDA_ESPERADA = -PE;
+			CAPITAL_ALOCADO = DIVIDE(CEA_NUM, SUM(PRAZO, MOB_CAR));
+			RESULTADO_OPERACIONAL = RO;	
+			CUSTOS_ADM = -SUM(custo_cobranca_atraso, custo_em_dia);
+			DESPESAS_TRIBUTARIAS = -SUM(IMPOSTO_TARIFA, IMPOSTO_PIS_COFINS);
+			RESULTADO_ANTES_IR_CS = LAIR;
+			IMPOSTO_IR_CS = -IMPOSTO_IR_CS;
+			IMPOSTO_TARIFA = -IMPOSTO_TARIFA;
+			IMPOSTO_PIS_COFINS = -IMPOSTO_PIS_COFINS;
+			RESULTADO_GERENCIAL_OPERACIONAL = RGO;
+			CUSTO_CAPITAL_AO_PRAZO = SUM(((1 + CUSTO_CAPITAL_AA)**(SUM(PRAZO, MOB_CAR)/12)),-1);
+			EVA = (RGO-((CUSTO_CAPITAL_AO_PRAZO/SUM(PRAZO, MOB_CAR))*CAPITAL_ALOCADO));/*CALCULO DO VALOR ECONOMICO GERADO*/
+			AUMENTO_PDD_MARGEM = SUM(AUMENTO_PE)/MFB;/*PROXY DE AUMENTO DE PDD SOBRE A MARGEM GERADA*/
+			INDICE_EFICIENCIA = (SUM(custo_cobranca_atraso, custo_em_dia))/PB;/*CUSTOS EM RELACAO AO PB*/
+			RAROC_EX_ANT_PIT = DIVIDE(RGO, CAPITAL_ALOCADO);/*RAROC CALCULADO NO FINAL DO PRAZO AO ANO*/
+			SPREAD_AM = SUM((1+taxa_produto_am)/(1+taxa_funding_am),-1);/*CALCULO DO SPREAD*/
+			RAROC_TARGET = SUM(CUSTO_CAPITAL_AO_PRAZO, 0.01);/*ALVO PARA A TAXA TARGET*/
+			ALPHA = SUM(RAROC_EX_ANT_PIT, -RAROC_TARGET);/*PARAMETRO DE OTIMIZACAO*/
+			TAXA_TARGET_AM = TAXA_PRODUTO_AM;
+	run;
+	data _null_;
+		set &bdest6.;
+			call symput ('raroc_calc', RAROC_EX_ANT_PIT);
+			call symput ('alpha_calc', ALPHA);
+			call symput ('taxa_am', taxa_produto_am);
+			call symput ('prazo', prazo);
+			call symput ('target', RAROC_TARGET);
+	run;
+%mend;
+
+/*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[Aula - 08]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/
+
+%macro RAROC(taxa_am=);
+	data R;
+	
+	%global raroc_calc;
+	%global alpha_calc;
+	%global prazo;
+	%global target;
+	%global mob_car;
+	
+	/*INPUTS DO USUARIO - AS DEMAIS COMPONENTES PODERAO SER PARAMETRIZADAS DA MESMA FORMA*/
+	
+	%let num_mes_ref = 202408;
+	%let prazo = 24;
+	%let VP = 5000;
+	%let carencia = 30;
+	%let PD_12 = 0.01;
+	%let car_aux = %sysevalf(&carencia. - 30);
+	%let mob_car = %sysevalf(&car_aux. / 30);
+
+	/*CUSTO DO CAPITAL EXIGIDO = FTP[106% DI aa] + SPREAD[4% aa] = 17.65%aa + 4%aa[SPREAD] JUROS SIMPLES AO ANO*/
+	%let ftp = 106/100;
+	%let DI = 10.5/100;
+	%let Spread_IR = 4/100;
+	%let custo_capital_aa = %sysevalf(%sysevalf((&ftp.)*(%sysevalf(&DI))+%sysevalf(&Spread_IR)));
+	%let custo_capital_ao_prazo = %sysevalf((&custo_capital_aa.)*(%sysevalf(&prazo. + &mob_car)/12));
+	%let target = %sysevalf(&custo_capital_ao_prazo. + 0.0001);
+	
+	ref = &num_mes_ref.;
+	taxa = &taxa_am.;
+	prazo = &prazo.;
+	financiado = &VP.;
+	carencia = &carencia.;
+	PD_cliente = &PD_12.;
+	Custo_capital = &custo_capital_ao_prazo.;
+	Target = &target.;
+	
+	/*PRE IOF */
+		%InsereParametros(output.base_entrada, output.base_entrada);
+		%taxas_dia(output.base_entrada, b1);
+		%carencia(b1, b2);
+		%carencia2(b2, b3);
+		%fluxo_financeiro(b3, b3s, b3p);
+		%sac(b3s, b4s);
+		%price(b3p, b4p);
+		%junta_fluxos(b4s, b4p, b5);
+		%CalculaIOF(b5, b6);
+		%IOFAcum(b6, b6_iof);
+		%SomaIOF(output.base_entrada, b6_iof, b7_iof);
+		%AdicionaIOF(b7_iof, output.base_entrada_iof);
+		/*POS IOF*/		
+		%taxas_dia(output.base_entrada_iof, b1);
+		%carencia(b1, b2);
+		%carencia2(b2, b3);
+		%fluxo_financeiro(b3, b3s, b3p);
+		%sac(b3s, b4s);
+		%price(b3p, b4p);
+		%junta_fluxos(b4s, b4p, b5);
+		/*RAROC*/
+		%AplicaCustosTarifa(b5, b6);
+		%CriaPDePAND(b6, b7);
+		%CalculaRAROC(b7, b8, b9, b10, output.ANALITICA_%substr(&taxa_am.,3,3), b11, output.RAROC_%substr(&taxa_am.,3,3));
+
+	run;
+%mend;
+
+%macro RAROC_IT();
+		%do k = 1 %to 100;
+			%RAROC(taxa_am=%sysevalf(&k./1000));
+		%end;
+	%mend;
+%RAROC_IT();
+
+data output.raroc;
+	set output.raroc_:;
+		if alpha < 0 then do;
+			resultado = "prejuizo";
+		end;
+		else do;
+			resultado = "lucro";
+		end;
+run;
+
+data output.analitica;
+	set output.analitica_:;
+run;
+
+/* proc datasets library=OUTPUT kill; */
+/* run; */
+/* quit; */
